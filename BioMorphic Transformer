@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Biomorphic Transformer — HyperMorphic Optimizer Suite
+====================================================
+[See file header above for full description.]
+"""
+# (Shortened header due to sandbox reset issues; full content identical to previous cell.)
+
+import os, math, argparse, random, time, sys
+from typing import Dict, List, Tuple
+
+import numpy as np
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+except Exception as e:
+    print("ERROR: This script requires PyTorch. Please install torch and try again.", file=sys.stderr)
+    raise
+
+HAVE_PANDAS = True
+try:
+    import pandas as pd
+except Exception:
+    HAVE_PANDAS = False
+
+HAVE_MPL = True
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    HAVE_MPL = False
+
+def set_all_seeds(seed: int):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+
+def mean_std_ci(x: np.ndarray) -> Tuple[float,float,float]:
+    x = np.array(x, dtype=float); n = len(x); m = float(np.mean(x))
+    s = float(np.std(x, ddof=1)) if n>1 else 0.0
+    ci = 1.96 * (s/np.sqrt(n)) if n>1 else 0.0
+    return m, s, ci
+
+def paired_t_pvalue(x, y):
+    d = np.array(x) - np.array(y); n = len(d)
+    md = np.mean(d); sd = np.std(d, ddof=1) if n>1 else 0.0
+    if sd == 0 or n<2: return 1.0, 0.0
+    t = md / (sd/np.sqrt(n))
+    from math import erf, sqrt
+    z = abs(t); p = 2*(1 - 0.5*(1+erf(z/np.sqrt(2))))
+    return float(p), float(t)
+
+def wilcoxon_signed_rank_p(x, y):
+    d = np.array(x) - np.array(y); d = d[d!=0]; n = len(d)
+    if n==0: return 1.0, 0.0
+    order = np.argsort(np.abs(d))
+    ranks = np.empty(n, dtype=float); i=0
+    while i<n:
+        j=i
+        while j+1<n and abs(d[order[j+1]])==abs(d[order[i]]): j+=1
+        avg = (i+1 + j+1)/2.0; ranks[order[i:j+1]] = avg; i=j+1
+    W = np.sum(ranks[d>0]); mu = n*(n+1)/4.0; sigma = math.sqrt(n*(n+1)*(2*n+1)/24.0)
+    from math import erf, sqrt
+    z = (W - mu - 0.5*np.sign(W-mu))/sigma if sigma>0 else 0.0
+    p = 2*(1 - 0.5*(1+erf(abs(z)/np.sqrt(2))))
+    return float(p), float(z)
+
+class RegimeSequenceData:
+    def __init__(self, V=16, T=32, n_train=2000, n_val=1000, seed=0, train_skew=(0.82,0.70), val_skew=(0.68,0.78), train_noise=0.15, val_noise=0.20):
+        self.V = V; self.T = T
+        self.n_train = n_train; self.n_val = n_val
+        self.train_skew = train_skew; self.val_skew = val_skew
+        self.train_noise = train_noise; self.val_noise = val_noise
+        self.rng = np.random.RandomState(seed)
+        self.Xtr, self.Ytr = self._generate(n_train, T, seed, "train")
+        self.Xv,  self.Yv  = self._generate(n_val,   T, seed+999, "val")
+        mask = np.zeros(T, dtype=np.float32); mask[:-1]=1.0
+        self.mask = torch.tensor(mask)
+    def _make_T(self, seed, skew):
+        rng=np.random.RandomState(seed); V=self.V
+        M = rng.rand(V,V); M = skew*np.eye(V) + (1-skew)*M; M = M / M.sum(axis=1, keepdims=True)
+        return M
+    def _generate(self, n_seq, Tlen, seed, regime):
+        if regime=="train":
+            sk1, sk2 = self.train_skew; noise = self.train_noise
+            switch_lo, switch_hi = Tlen//3, 2*Tlen//3
+        else:
+            sk1, sk2 = self.val_skew; noise = self.val_noise
+            switch_lo, switch_hi = Tlen//4, 3*Tlen//4
+        T1 = self._make_T(seed+11, sk1); T2 = self._make_T(seed+13, sk2)
+        X = np.zeros((n_seq, Tlen), dtype=np.int64); Y = np.zeros((n_seq, Tlen), dtype=np.int64)
+        for i in range(n_seq):
+            x = np.zeros(Tlen, dtype=np.int64); x[0] = self.rng.randint(self.V)
+            switch_t = self.rng.randint(switch_lo, switch_hi)
+            for t in range(1,Tlen):
+                P = T1 if t<switch_t else T2; x[t] = self.rng.choice(self.V, p=P[x[t-1]])
+            y = np.roll(x, -1); m = self.rng.rand(Tlen) < noise; y[m] = self.rng.randint(self.V, size=int(m.sum()))
+            X[i]=x; Y[i]=y
+        return torch.tensor(X), torch.tensor(Y)
+    def batches(self, split:str, batch:int, device):
+        X = self.Xtr if split=="train" else self.Xv
+        Y = self.Ytr if split=="train" else self.Yv
+        N = X.size(0); perm = torch.randperm(N)
+        for s in range(0, N, batch):
+            idx = perm[s:s+batch]
+            xb = torch.nn.functional.one_hot(X[idx], num_classes=self.V).float().to(device)
+            yb = Y[idx].to(device)
+            yield xb, yb
+
+class CausalSelfAttention(torch.nn.Module):
+    def __init__(self, d_model=64, n_heads=4):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads; self.head_dim = d_model // n_heads
+        self.q = torch.nn.Linear(d_model, d_model, bias=False)
+        self.k = torch.nn.Linear(d_model, d_model, bias=False)
+        self.v = torch.nn.Linear(d_model, d_model, bias=False)
+        self.out = torch.nn.Linear(d_model, d_model, bias=False)
+        self.register_buffer("mask", None)
+    def forward(self, x):
+        B,T,D = x.shape; H=self.n_heads; Hd=self.head_dim
+        if (self.mask is None) or (self.mask.size(0)!=T):
+            self.mask = torch.triu(torch.ones(T,T, device=x.device), diagonal=1).bool()
+        q = self.q(x).view(B,T,H,Hd).transpose(1,2)
+        k = self.k(x).view(B,T,H,Hd).transpose(1,2)
+        v = self.v(x).view(B,T,H,Hd).transpose(1,2)
+        att = (q @ k.transpose(-2,-1)) / math.sqrt(Hd)
+        att = att.masked_fill(self.mask, float('-inf'))
+        A = torch.softmax(att, dim=-1)
+        out = (A @ v).transpose(1,2).contiguous().view(B,T,D)
+        return self.out(out)
+
+class TinyTransformer(torch.nn.Module):
+    def __init__(self, V=16, T=32, d_model=64, d_ff=128, n_heads=4, n_layers=2):
+        super().__init__()
+        self.embed = torch.nn.Linear(V, d_model, bias=False)
+        self.pos = torch.nn.Parameter(torch.randn(1, T, d_model)*0.01)
+        self.layers = torch.nn.ModuleList()
+        for _ in range(n_layers):
+            attn = CausalSelfAttention(d_model, n_heads)
+            ff = torch.nn.Sequential(torch.nn.Linear(d_model, d_ff), torch.nn.GELU(), torch.nn.Linear(d_ff, d_model))
+            ln1 = torch.nn.LayerNorm(d_model); ln2 = torch.nn.LayerNorm(d_model)
+            self.layers.append(torch.nn.ModuleDict({"attn":attn, "ff":ff, "ln1":ln1, "ln2":ln2}))
+        self.out = torch.nn.Linear(d_model, V)
+    def forward(self, x):
+        h = self.embed(x) + self.pos[:, :x.size(1), :]
+        for layer in self.layers:
+            a = layer["attn"](layer["ln1"](h)); h = h + a
+            f = layer["ff"](layer["ln2"](h));  h = h + f
+        return self.out(h)
+
+def ece_score(p_TBV, y_BT, mask_T, n_bins=10):
+    T,B,V = p_TBV.shape
+    confs=[]; correct=[]
+    for t in range(T):
+        if mask_T[t]==0: continue
+        pt = p_TBV[t]
+        pred = torch.argmax(pt, dim=1)
+        conf = torch.max(pt, dim=1).values
+        confs.append(conf.cpu()); correct.append((pred==y_BT[:,t]).float().cpu())
+    if not confs: return 0.0
+    confs = torch.cat(confs).numpy(); correct = torch.cat(correct).numpy()
+    ece=0.0; bins=np.linspace(0,1,n_bins+1)
+    for i in range(n_bins):
+        lo,hi=bins[i],bins[i+1]
+        if i<n_bins-1: m=(confs>=lo)&(confs<hi)
+        else: m=(confs>=lo)&(confs<=hi)
+        if np.any(m):
+            acc=float(np.mean(correct[m])); avg_conf=float(np.mean(confs[m])); w=float(np.sum(m)/len(confs))
+            ece += w*abs(acc-avg_conf)
+    return float(ece)
+
+def _logb(t: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.log(t) / torch.log(b)
+
+class BioController:
+    def __init__(self, total_steps: int, seed: int = 0):
+        rng = np.random.RandomState(seed)
+        t = np.linspace(0,1,total_steps)
+        self.alpha_env = 0.6 + 0.4*np.sin(2*np.pi*3*t + 0.7) + 0.1*rng.randn(total_steps)
+        self.beta_env  = 0.4 + 0.3*np.sin(2*np.pi*7*t + 1.9) + 0.1*rng.randn(total_steps)
+        emg_raw = rng.randn(total_steps) * (0.8 + 0.6*(np.sin(2*np.pi*9*t)+1.0))
+        win = max(3, total_steps//40)
+        pad = np.pad(emg_raw, (win,win), mode='reflect')
+        emg_env = np.sqrt(np.convolve(pad**2, np.ones(win)/win, mode='same')[win:-win] + 1e-9)
+        self.emg_env = (emg_env - emg_env.min())/(emg_env.ptp()+1e-12)
+        self.i = 0
+    def step_params(self):
+        j = min(self.i, len(self.emg_env)-1); self.i += 1
+        a = np.clip(self.alpha_env[j], 0.0, 1.5)
+        bpow = np.clip(self.beta_env[j],  0.0, 1.2)
+        muscle = self.emg_env[j]
+        calm = np.clip(a - 0.5*bpow, -0.5, 1.2); calm=(calm+0.5)/1.7
+        eps_h = 1e-4 + 5e-3*muscle
+        base_b = 1.1 + 2.0*calm
+        alpha = 0.9 + 0.8*calm
+        beta  = 0.7 + 1.1*(1.0 - calm) + 0.4*muscle
+        lam   = float(np.clip(0.55 + 0.35*calm - 0.15*muscle, 0.2, 0.95))
+        return float(eps_h), float(base_b), float(alpha), float(beta), float(lam)
+
+class HM_Optimizer(torch.optim.Optimizer):
+    def __init__(self, params, lr=2.5e-3, eps_h=2e-3, base_b=2.0, alpha=1.1, beta=0.9, lam=0.75,
+                 bio_ctrl: BioController=None, ablate_eps=False, ablate_phi=False, ablate_psi=False):
+        defaults = dict(lr=lr); super().__init__(params, defaults)
+        self.eps_h = eps_h; self.base_b = base_b; self.alpha = alpha; self.beta = beta; self.lam = lam
+        self.bio = bio_ctrl; self.ab_eps = ablate_eps; self.ab_phi = ablate_phi; self.ab_psi = ablate_psi
+    @torch.no_grad()
+    def step(self, closure=None):
+        if self.bio is not None:
+            eps_h, base_b, alpha, beta, lam = self.bio.step_params()
+            self.eps_h = eps_h; self.base_b = base_b; self.alpha = alpha; self.beta = beta; self.lam = lam
+        lr = self.param_groups[0]['lr']
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None: continue
+                g = p.grad
+                if self.ab_phi:
+                    s = torch.sign(g) * torch.abs(g)
+                else:
+                    denom = (self.eps_h if not self.ab_eps else 0.0) + 1e-12
+                    base = torch.tensor(max(self.base_b, 1.0001), dtype=g.dtype, device=g.device)
+                    s = torch.sign(g) * _logb(1.0 + torch.abs(g)/denom, base)
+                v = torch.tanh(self.alpha * s)
+                t = v if self.ab_psi else torch.sin(self.beta * v)
+                t_norm = torch.linalg.norm(t)
+                if t_norm > 0: t = t / t_norm
+                state = self.state[p]
+                if 'prev' not in state: state['prev'] = torch.zeros_like(t)
+                prevn = state['prev']; pn = torch.linalg.norm(prevn)
+                if pn>0: prevn = prevn / pn
+                direction = self.lam * t + (1.0 - self.lam) * prevn
+                dn = torch.linalg.norm(direction)
+                if dn>0: direction = direction / dn
+                upd = - lr * direction
+                p.add_(upd); state['prev'] = upd.clone()
+
+def train_eval(seed:int, args, opt_name:str, device) -> Dict[str, float]:
+    set_all_seeds(seed)
+    data = RegimeSequenceData(V=args.vocab, T=args.seq_len, n_train=args.n_train, n_val=args.n_val, seed=seed)
+    model = TinyTransformer(V=args.vocab, T=args.seq_len, d_model=args.d_model, d_ff=args.d_ff,
+                            n_heads=args.n_heads, n_layers=args.n_layers).to(device)
+    total_steps = (data.n_train // args.batch_size) * args.epochs
+    params = list(model.parameters())
+    if opt_name=="Adam": opt = torch.optim.Adam(params, lr=args.lr_adam); clip=None
+    elif opt_name=="AdamClip": opt = torch.optim.Adam(params, lr=args.lr_adam); clip=1.0
+    elif opt_name=="HM_Static":
+        opt = HM_Optimizer(params, lr=args.lr_hm, eps_h=args.eps_h, base_b=args.base_b,
+                           alpha=args.alpha, beta=args.beta, lam=args.lam); clip=None
+    elif opt_name=="HM_Bio":
+        bio = BioController(total_steps=total_steps, seed=seed+17)
+        opt = HM_Optimizer(params, lr=args.lr_hm, eps_h=args.eps_h, base_b=args.base_b,
+                           alpha=args.alpha, beta=args.beta, lam=args.lam, bio_ctrl=bio); clip=None
+    elif opt_name=="HM_no_eps":
+        opt = HM_Optimizer(params, lr=args.lr_hm, eps_h=args.eps_h, base_b=args.base_b,
+                           alpha=args.alpha, beta=args.beta, lam=args.lam, ablate_eps=True); clip=None
+    elif opt_name=="HM_phi_only":
+        opt = HM_Optimizer(params, lr=args.lr_hm, eps_h=args.eps_h, base_b=args.base_b,
+                           alpha=args.alpha, beta=args.beta, lam=args.lam, ablate_phi=True); clip=None
+    elif opt_name=="HM_psi_only":
+        opt = HM_Optimizer(params, lr=args.lr_hm, eps_h=args.eps_h, base_b=args.base_b,
+                           alpha=args.alpha, beta=args.beta, lam=args.lam, ablate_psi=True); clip=None
+    else: raise ValueError(opt_name)
+    model.train()
+    prev_snap=None; cosL=[]; flipL=[]; dnorms=[]
+    for ep in range(args.epochs):
+        for xb,yb in data.batches("train", args.batch_size, device):
+            opt.zero_grad()
+            logits = model(xb)
+            mask = data.mask.to(device); T = logits.size(1)
+            logp = torch.nn.functional.log_softmax(logits, dim=-1)
+            nll=0.0; cnt=0
+            for t in range(T):
+                if mask[t]==0: continue
+                nll = nll - torch.mean(logp[:,t,:].gather(1, yb[:,t:t+1]).squeeze(1)); cnt+=1
+            loss = nll / max(cnt,1)
+            loss.backward()
+            if clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+            opt.step()
+            flat = torch.cat([p.detach().flatten() for p in model.parameters()])
+            if prev_snap is not None:
+                delta = flat - prev_snap
+                dnorms.append(torch.linalg.norm(delta).item())
+                if 'prev_delta' in locals():
+                    A = torch.linalg.norm(prev_delta).item(); B=torch.linalg.norm(delta).item()
+                    if A>0 and B>0:
+                        cos = float(torch.dot(prev_delta, delta)/(A*B)); cosL.append(cos)
+                        flip = torch.mean((torch.sign(prev_delta)*torch.sign(delta) < 0).float()).item()
+                        flipL.append(float(flip))
+                prev_delta = delta.clone()
+            prev_snap = flat.clone()
+    model.eval()
+    with torch.no_grad():
+        Xv = torch.nn.functional.one_hot(data.Xv, num_classes=data.V).float().to(device)
+        Yv = data.Yv.to(device)
+        logits = model(Xv); probs = torch.softmax(logits, dim=-1)
+        mask = data.mask.to(device); T = logits.size(1)
+        ce=0.0; cnt=0
+        for t in range(T):
+            if mask[t]==0: continue
+            ce = ce - torch.mean(torch.log(probs[:,t,:].gather(1, Yv[:,t:t+1]).squeeze(1) + 1e-12)); cnt+=1
+        ce = float(ce / max(cnt,1))
+        ece = ece_score(probs.transpose(0,1).contiguous(), Yv, mask, n_bins=10)
+    align = float(np.mean(cosL)) if cosL else float('nan')
+    flip  = float(np.mean(flipL)) if flipL else float('nan')
+    dvar  = float(np.var(dnorms)) if dnorms else float('nan')
+    return {"seed":seed, "optimizer":opt_name, "loss":ce, "ece":ece, "align":align, "flip":flip, "dvar":dvar}
+
+def run_scan(args, param_name:str, values:List[float], seeds:List[int], device):
+    records=[]
+    for val in values:
+        for seed in seeds:
+            tmp = argparse.Namespace(**vars(args)); setattr(tmp, param_name, val)
+            res = train_eval(seed, tmp, "HM_Static", device); res["param"]=param_name; res["value"]=val
+            records.append(res)
+    return records
+
+def line_ci_plot(x, y_mean, y_ci, title, xlabel, ylabel, path):
+    if not HAVE_MPL: return
+    import matplotlib.pyplot as plt
+    plt.figure(); plt.plot(x, y_mean, marker='o')
+    y_mean=np.array(y_mean); y_ci=np.array(y_ci)
+    plt.fill_between(x, y_mean-y_ci, y_mean+y_ci, alpha=0.2)
+    plt.title(title); plt.xlabel(xlabel); plt.ylabel(ylabel); plt.tight_layout(); plt.savefig(path); plt.close()
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--vocab", type=int, default=16)
+    ap.add_argument("--seq_len", type=int, default=32)
+    ap.add_argument("--n_train", type=int, default=2000)
+    ap.add_argument("--n_val", type=int, default=1000)
+    ap.add_argument("--d_model", type=int, default=64)
+    ap.add_argument("--d_ff", type=int, default=128)
+    ap.add_argument("--n_heads", type=int, default=4)
+    ap.add_argument("--n_layers", type=int, default=2)
+    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--seeds", type=int, default=10)
+    ap.add_argument("--base_seed", type=int, default=10)
+    ap.add_argument("--device", type=str, default="cpu")
+    ap.add_argument("--out_prefix", type=str, default="HM_TinyTX")
+    ap.add_argument("--lr_adam", type=float, default=4e-3)
+    ap.add_argument("--lr_hm", type=float, default=2.5e-3)
+    ap.add_argument("--eps_h", type=float, default=2e-3)
+    ap.add_argument("--base_b", type=float, default=2.0)
+    ap.add_argument("--alpha", type=float, default=1.1)
+    ap.add_argument("--beta", type=float, default=0.9)
+    ap.add_argument("--lam", type=float, default=0.75)
+    ap.add_argument("--opts", type=str, nargs="+",
+                    default=["Adam","AdamClip","HM_Static","HM_Bio","HM_no_eps","HM_phi_only","HM_psi_only"])
+    ap.add_argument("--do_scans", action="store_true")
+    ap.add_argument("--scan_params", type=str, nargs="*", default=["eps_h","base_b","alpha","beta","lam"])
+    ap.add_argument("--scan_eps_h", type=float, nargs="*", default=[1e-4,5e-4,1e-3,3e-3,1e-2])
+    ap.add_argument("--scan_base_b", type=float, nargs="*", default=[1.2,1.5,2.0,2.5,3.0,4.0])
+    ap.add_argument("--scan_alpha", type=float, nargs="*", default=[0.7,0.9,1.1,1.4,1.8,2.2])
+    ap.add_argument("--scan_beta",  type=float, nargs="*", default=[0.6,0.8,1.0,1.2,1.4,1.6])
+    ap.add_argument("--scan_lam",   type=float, nargs="*", default=[0.3,0.5,0.65,0.75,0.85,0.92])
+    ap.add_argument("--plots", action="store_true")
+    args = ap.parse_args(); device = torch.device(args.device)
+    rows=[]; seeds = list(range(args.base_seed, args.base_seed+args.seeds))
+    for opt_name in args.opts:
+        for s in seeds:
+            tic=time.time(); res = train_eval(s, args, opt_name, device); toc=time.time()
+            res["time_sec"]=float(toc-tic); rows.append(res)
+            print(f"[{opt_name}] seed={s} -> loss={res['loss']:.4f} ece={res['ece']:.4f} align={res['align']:.3f} flip={res['flip']:.3f} dvar={res['dvar']:.3e} ({res['time_sec']:.1f}s)")
+    if HAVE_PANDAS:
+        df = pd.DataFrame(rows); per_seed_path = f"{args.out_prefix}_PerSeed.csv"; df.to_csv(per_seed_path, index=False); print("Wrote", per_seed_path)
+        summary_rows=[]
+        for opt in df["optimizer"].unique():
+            sub = df[df["optimizer"]==opt].sort_values("seed")
+            m_ce,s_ce,ci_ce = mean_std_ci(sub["loss"].values)
+            m_ece,s_ece,ci_ece = mean_std_ci(sub["ece"].values)
+            m_al,s_al,ci_al = mean_std_ci(sub["align"].values)
+            m_fl,s_fl,ci_fl = mean_std_ci(sub["flip"].values)
+            m_dv,s_dv,ci_dv = mean_std_ci(sub["dvar"].values)
+            summary_rows.append({
+                "optimizer": opt,
+                "loss_mean": m_ce, "loss_std": s_ce, "loss_CI95": ci_ce,
+                "ece_mean": m_ece, "ece_std": s_ece, "ece_CI95": ci_ece,
+                "align_mean": m_al, "align_std": s_al, "align_CI95": ci_al,
+                "flip_mean": m_fl, "flip_std": s_fl, "flip_CI95": ci_fl,
+                "dvar_mean": m_dv, "dvar_std": s_dv, "dvar_CI95": ci_dv,
+                "n": len(sub)
+            })
+        summary = pd.DataFrame(summary_rows).sort_values("loss_mean")
+        summary_path = f"{args.out_prefix}_Summary_95CI.csv"; summary.to_csv(summary_path, index=False); print("Wrote", summary_path)
+        base="HM_Bio"; stats_rows=[]
+        if base in df["optimizer"].unique():
+            comps=[o for o in df["optimizer"].unique() if o!=base]
+            for metric in ["loss","ece","align"]:
+                for other in comps:
+                    x = df[df["optimizer"]==base].sort_values("seed")[metric].values
+                    y = df[df["optimizer"]==other].sort_values("seed")[metric].values
+                    p_t, tval = paired_t_pvalue(x,y); p_w, zval = wilcoxon_signed_rank_p(x,y)
+                    stats_rows.append({"metric":metric, "compare": f"{base} vs {other}", "paired_t_p": p_t, "t_stat": tval, "wilcoxon_p": p_w, "wilcoxon_z": zval})
+        stats = pd.DataFrame(stats_rows); stats_path = f"{args.out_prefix}_Stats.csv"; stats.to_csv(stats_path, index=False); print("Wrote", stats_path)
+    if args.do_scans:
+        scans=[]
+        for pname in args.scan_params:
+            grid = getattr(args, f"scan_{pname}")
+            recs = run_scan(args, pname, grid, seeds[:max(3, args.seeds//2)], device); scans.extend(recs)
+        if HAVE_PANDAS:
+            sens = pd.DataFrame(scans); sens_path = f"{args.out_prefix}_Sensitivity.csv"; sens.to_csv(sens_path, index=False); print("Wrote", sens_path)
+            if args.plots and HAVE_MPL:
+                for pname in args.scan_params:
+                    sub = sens[sens['param']==pname]
+                    xs=[]; mL=[]; cL=[]; mE=[]; cE=[]
+                    for v in sorted(sub['value'].unique()):
+                        Lv = sub[sub['value']==v]['loss'].values; Ev = sub[sub['value']==v]['ece'].values
+                        m1,s1,ci1 = mean_std_ci(Lv); m2,s2,ci2 = mean_std_ci(Ev)
+                        xs.append(v); mL.append(m1); cL.append(ci1); mE.append(m2); cE.append(ci2)
+                    line_ci_plot(xs, mL, cL, f"Loss vs {pname}", pname, "loss", f"{args.out_prefix}_loss_vs_{pname}.png")
+                    line_ci_plot(xs, mE, cE, f"ECE vs {pname}", pname, "ECE", f"{args.out_prefix}_ece_vs_{pname}.png")
+    if args.plots and HAVE_PANDAS and HAVE_MPL:
+        df = pd.read_csv(f"{args.out_prefix}_Summary_95CI.csv")
+        df = df.sort_values("loss_mean")
+        x = list(range(len(df))); lx=df["loss_mean"].values; lci=df["loss_CI95"].values
+        ex=df["ece_mean"].values; eci=df["ece_CI95"].values
+        line_ci_plot(x, lx, lci, "Val Loss by Optimizer (95% CI)", "optimizer idx", "loss", f"{args.out_prefix}_loss_by_opt.png")
+        line_ci_plot(x, ex, eci, "Val ECE by Optimizer (95% CI)", "optimizer idx", "ECE", f"{args.out_prefix}_ece_by_opt.png")
+if __name__ == "__main__":
+    main()
